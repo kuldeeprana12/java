@@ -1,0 +1,400 @@
+CREATE OR REPLACE PACKAGE BODY OL00.pkg_load_crmem_sap_ELA AS
+--------------------------------------------------------------------------------
+--    CVS Log        : $log$
+--------------------------------------------------------------------------------
+--    Program        : pkg_load_crmem_sap_ELA
+--    Type           : Package Body
+--    Purpose        : To load credit memo tables from work tables
+--                     containing data received from SAP
+--    Called By      : Batch Shell Script
+--
+--    Notes          : After execution, you can determine the results for each
+--                     row processed by looking at s_crmem_wrk.  The CRMEM_ID
+--                     column will contain the following values.
+--
+--                       any positive number = processed successfully
+--                       -1                  = an sql error occurred
+--                       -2                  = the record was bypassed (probably
+--                                             because there is no s_cr entry
+--                                             for the record's keys)
+--
+--    Change Log     :
+--    Who          When      Comments
+--    -----------  --------  -----------------------------------------------
+--    George C     07/14/03  Creation
+--    Ginger H     05/27/04  Modified to fetch all rows from s_crmem_wrk
+--                           table where crmem_id = 0
+--    Chris $      11/30/04  Impelmented multiple performance enhancements.
+--                           - Made cust_acct_id comparisons more dynamic.
+--                           - Added CVS log info.
+--                           - Added nested exception handling logic to
+--                             existing exception handling block in
+--                             prc_init_load_crmem.
+--                           - Added an else (set crmem_id to -1) to the row
+--                             count test in prc_init_load_crmem.
+--                           - Cleaned up the stdout messages.
+--                           - Eliminated calls to DUAL and streamlined
+--                             unnecessary COUNT and MAX functions.
+--                           - Eliminated both output files and most of the
+--                             dbms_output.put_line calls.
+--                           - Eliminated most global variables.
+--                           - Incorporated logic from prc_update_crmem_wrk_id,
+--                             prc_create_crmem_hdr and prc-update_cr_tots into
+--                             prc_init_load_crmem.
+--                           - rewrote all logic accessing specific s_crmem_wrk
+--                             and s_crmem_lin_wrk rows to use the new
+--                             crmem_wrk_id column.
+--                           - added logic to set the status code to "F" on
+--                             s_cr for all credits processed.
+--    Chris $      12/21/04  Per webMethods functional design, renamed new
+--                           column from "crmem_wrk_id" to "sap_idoc_num".
+--    Chris $      06/21/05  Per Ordering Issue 1078, enhanced s_drug_item_prc
+--                           access to check s_drug_cust_acct first for a pri-
+--                           mary account.  If a primary account exists, use it
+--                           on s_drug_item_prc.                 Soli Deo Gloria
+--------------------------------------------------------------------------------
+--Global Variables
+procobj          fmwk.process_object;
+g_proc_name      VARCHAR2(30);
+--Forward Declarations
+PROCEDURE prc_init_load_crmem(  ai_cust_acct_id    IN     s_cr.cust_acct_id%TYPE,
+                                ai_cust_cr_id      IN     s_cr.cust_cr_id%TYPE,
+                                ai_cust_uniq_id    IN     s_cr.cust_cr_uniq_id%TYPE,
+                                ai_sap_idoc_num    IN     s_crmem_wrk.sap_idoc_num%TYPE,
+                                aio_rows_errored   IN OUT integer,
+                                aio_rows_bypassed  IN OUT integer,
+                                aio_return_cd      IN OUT integer,
+                                ao_rows               OUT integer );
+PROCEDURE prc_create_crmem_dtl( ai_cr_id           IN     s_cr.cr_id%TYPE,
+                                ai_cust_acct_id    IN     s_cr.cust_acct_id%TYPE,
+                                ai_crmem_id        IN     s_crmem.crmem_id%TYPE,
+                                ai_sap_idoc_num    IN     s_crmem_wrk.sap_idoc_num%TYPE,
+                                aio_rows           IN OUT integer );
+-------------------------------------------------------------------------------
+--Main Procedure for the Acknowledgment Load
+-------------------------------------------------------------------------------
+PROCEDURE prc_load_crmem_sap  AS
+  mainErr                     NUMBER;
+  mainMsg                     VARCHAR(1024);
+  l_tx_size                   integer;
+  l_rows_processed            integer;
+  l_rows_bypassed             integer;
+  l_rows_errored              integer;
+  l_rows_temp                 integer;
+  l_tx_processed              integer;
+  l_return_code               integer;
+  CURSOR crmem_cursor( tx_size integer )  IS
+    SELECT *             FROM s_crmem_wrk
+     WHERE crmem_id         = 0
+       AND rownum          <= tx_size
+       FOR UPDATE;
+  cur_crmem                   crmem_cursor%ROWTYPE;
+BEGIN
+  g_proc_name              := 'prc_load_crmem_sap';
+  procobj                  := fmwk.process_init( name=> 'pkg_load_crmem_sap_ELA.prc_load_crmem_sap' );
+  BEGIN
+    l_tx_processed         := 0;
+    l_rows_processed       := 0;
+    l_rows_bypassed        := 0;
+    l_rows_errored         := 0;
+    l_return_code          := 0;
+    l_tx_size              := fmwk.tx_size;
+    open crmem_cursor( l_tx_size );
+    LOOP
+      g_proc_name          := 'prc_load_crmem_sap - A';
+      fetch crmem_cursor into cur_crmem;
+      exit               when crmem_cursor%notfound;
+      prc_init_load_crmem( cur_crmem.cust_acct_id, cur_crmem.cust_cr_id, cur_crmem.cust_cr_uniq_id,
+                           cur_crmem.sap_idoc_num, l_rows_errored, l_rows_bypassed, l_return_code,
+                           l_rows_temp );
+      l_tx_processed       := l_tx_processed + 1;
+      l_rows_processed     := l_rows_processed + l_rows_temp;
+      g_proc_name          := 'prc_load_crmem_sap - B';
+      IF fmwk.tx_commit()   = TRUE  THEN
+        close crmem_cursor;
+        open  crmem_cursor( l_tx_size );
+      END IF;
+    END LOOP;
+    g_proc_name            := 'prc_load_crmem_sap - C';
+    dbms_output.put_line( '.' );
+    dbms_output.put_line( 'CRMEM TABLES HAVE BEEN SUCCESSFULLY LOADED FROM WORK TABLES.' );
+    dbms_output.put_line( '       Total rows read from cursor   = ' || l_tx_processed );
+    dbms_output.put_line( '       Total rows inserted/updated   = ' || l_rows_processed );
+    dbms_output.put_line( '       Total cursor rows bypassed    = ' || l_rows_bypassed );
+    dbms_output.put_line( '       Total cursor rows with errors = ' || l_rows_errored );
+  EXCEPTION
+    WHEN OTHERS THEN
+      mainErr              := SQLCODE;
+      mainMsg              := SQLERRM;
+      fmwk.log_error( handle=> procobj,
+                      sql_code=> sqlcode,
+                      sql_error=> sqlerrm,
+                      custom_text=> 'Exception in main loop, proc ' || g_proc_name,
+                      error_value=> cur_crmem.sap_idoc_num || ':' || cur_crmem.cust_acct_id || ':' ||
+                                    cur_crmem.cust_cr_id || ':' || cur_crmem.cust_cr_uniq_id );
+      ROLLBACK;
+      l_rows_errored       := l_rows_errored + sql%rowcount;
+      l_return_code        := 2;
+  END;
+  fmwk.do_commit;
+  fmwk.process_end( handle=> procobj, tx_processed=> l_tx_processed,
+                    rows_processed=> l_rows_processed, return_code=> l_return_code );
+END prc_load_crmem_sap;
+-------------------------------------------------------------------------------
+--Driver Routine for the Acknowledgment Load
+-------------------------------------------------------------------------------
+PROCEDURE prc_init_load_crmem( ai_cust_acct_id    IN     s_cr.cust_acct_id%TYPE,
+                               ai_cust_cr_id      IN     s_cr.cust_cr_id%TYPE,
+                               ai_cust_uniq_id    IN     s_cr.cust_cr_uniq_id%TYPE,
+                               ai_sap_idoc_num    IN     s_crmem_wrk.sap_idoc_num%TYPE,
+                               aio_rows_errored   IN OUT integer,
+                               aio_rows_bypassed  IN OUT integer,
+                               aio_return_cd      IN OUT integer,
+                               ao_rows               OUT integer ) AS
+  l_work_count               NUMBER( 5 );
+  acct_count                 NUMBER( 5 );--308
+  l_cr_id                    s_cr.cr_id%TYPE;
+  l_cust_acct_id             s_cr.cust_acct_id%TYPE;
+  l_tot_cr_amt               s_cr.tot_cr_amt%TYPE;
+  l_crmem_id                 s_crmem.crmem_id%TYPE;
+BEGIN
+  savepoint                  init_load_crmem;
+  g_proc_name             := 'prc_init_load_crmem';
+  l_cust_acct_id          := substr( ai_cust_acct_id, 5, 6 );
+  l_cr_id                 := 0;
+  l_crmem_id              := 0;
+  ao_rows                 := 0;
+  -- First check if the credit memo is in the database.  If the credit exists,
+  -- then we can process.  Otherwise, bypass the credit work row.
+  SELECT count( * ), max( c.cr_id )
+    INTO l_work_count, l_cr_id
+    FROM s_cr c
+   WHERE c.cust_acct_id    = l_cust_acct_id
+     AND c.cust_cr_id      = ai_cust_cr_id
+     AND c.cust_cr_uniq_id = ai_cust_uniq_id
+     AND rownum            = 1;
+--eah 308
+  IF l_work_count = 0 AND ai_cust_cr_id <> '0000' AND length(ai_cust_cr_id) = 10 THEN
+    select count(*)
+        into acct_count
+        from s_drug_cust_acct
+        where cust_acct_id=l_cust_acct_id;
+    IF acct_count > 0
+    THEN
+        select s_cr#cr_id.nextval
+        into l_cr_id
+        FROM dual;
+        insert into s_cr (cr_id, cust_acct_id, cust_cr_id, cust_cr_uniq_id, cr_stat_cd, updt_dts, user_id)
+        values(l_cr_id, l_cust_acct_id, ai_cust_cr_id, '00', 'F', sysdate, 'EXTERNAL');
+        l_work_count := SQL%RowCount;
+    END IF;
+  END IF;
+  IF l_work_count          = 1 THEN
+    --Update the work tables with the found master cr_id.
+    g_proc_name           := 'prc_init_load_crmem - A';
+    UPDATE s_crmem_wrk
+       SET crmem_id        = s_crmem#crmem_id.nextval
+     WHERE sap_idoc_num    = ai_sap_idoc_num
+    RETURN crmem_id     into l_crmem_id;
+    ao_rows               := ao_rows + sql%rowcount;
+    g_proc_name           := 'prc_init_load_crmem - B';
+    UPDATE s_crmem_lin_wrk
+       SET crmem_id        = l_crmem_id
+     WHERE sap_idoc_num    = ai_sap_idoc_num;
+    ao_rows               := ao_rows + sql%rowcount;
+    --Insert the credit memo header.
+    g_proc_name           := 'prc_init_load_crmem - C';
+    INSERT into s_crmem
+           ( crmem_id, cr_id, cust_acct_id,
+             cust_cr_id, cust_cr_uniq_id, crmem_crte_dt )
+    VALUES ( l_crmem_id, l_cr_id, l_cust_acct_id,
+             ai_cust_cr_id, ai_cust_uniq_id, sysdate );
+    ao_rows               := ao_rows + 1;
+    --Create credit memo items.
+    prc_create_crmem_dtl( l_cr_id, l_cust_acct_id, l_crmem_id, ai_sap_idoc_num, ao_rows );
+    --Update the credit memo header.
+    g_proc_name           := 'prc_init_load_crmem - D';
+    SELECT sum( ext_item_prc )
+      INTO l_tot_cr_amt
+      FROM s_crmem_item
+     WHERE crmem_id in ( SELECT crmem_id  FROM s_crmem  WHERE cr_id = l_cr_id );
+    g_proc_name           := 'prc_init_load_crmem - E';
+    UPDATE s_cr
+       SET tot_cr_amt      = l_tot_cr_amt,
+           user_id         = 'External',
+           cr_stat_cd      = 'F'
+     WHERE cr_id           = l_cr_id;
+    ao_rows               := ao_rows + sql%rowcount;
+  ELSE
+    --No s_cr record found.
+    g_proc_name           := 'prc_init_load_crmem - F';
+    UPDATE s_crmem_wrk
+       SET crmem_id        = -2
+     WHERE sap_idoc_num    = ai_sap_idoc_num;
+    aio_rows_bypassed     := aio_rows_bypassed + sql%rowcount;
+    ao_rows               := 0;
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    fmwk.log_error( handle=> procobj,
+                    sql_code=> sqlcode,
+                    sql_error=> sqlerrm,
+                    custom_text=> 'In ' || g_proc_name,
+                    error_value=> ' Cust:' || ai_cust_acct_id ||
+                                  ' ID:' || ai_cust_cr_id ||
+                                  ' Unique:' || ai_cust_uniq_id ||
+                                  ' Wrk ID:' || ai_sap_idoc_num ||
+                                  ' CRMEM ID:' || l_crmem_id ||
+                                  ' CR ID:' || l_cr_id );
+    ROLLBACK              to savepoint init_load_crmem;
+    UPDATE s_crmem_wrk
+       SET crmem_id        = -1
+     WHERE sap_idoc_num    = ai_sap_idoc_num;
+    aio_rows_errored      := aio_rows_errored + sql%rowcount;
+    ao_rows               := 0;
+    aio_return_cd         := 1;
+END prc_init_load_crmem;
+-------------------------------------------------------------------------------
+--Procedure to create credit memo items.
+-------------------------------------------------------------------------------
+PROCEDURE prc_create_crmem_dtl( ai_cr_id           IN     s_cr.cr_id%TYPE,
+                                ai_cust_acct_id    IN     s_cr.cust_acct_id%TYPE,
+                                ai_crmem_id        IN     s_crmem.crmem_id%TYPE,
+                                ai_sap_idoc_num    IN     s_crmem_wrk.sap_idoc_num%TYPE,
+                                aio_rows           IN OUT integer ) AS
+  l_count_cr_item             NUMBER( 5 );
+  l_cr_item_id                s_cr_item.cr_item_id%TYPE;
+  l_crmem_item_id             s_crmem_item.crmem_item_id%TYPE;
+  l_sell_desc                 s_drug_item.sell_dscr_txt%type;
+  l_mfg_unit_cd               s_drug_item.mfg_unit_cd%type;
+  --l_prc_cd                    s_drug_item_prc.spcl_prc_cd%type;
+  --l_curr_ctlg_prc             s_drug_item_prc.proper_cntrc_prc%type;
+  l_unit_prc                  s_drug_item.unit_sell_prc%type;
+  -- Issue #1078: Following variable added.
+  l_pri_cust_acct_id          s_drug_cust_acct.pri_cust_acct_id%TYPE;
+  v_cr_item_id                s_cr_item.cr_item_id%TYPE; --QC 11120
+
+
+
+  CURSOR crmem_lin_wrk_cur IS
+    SELECT *
+      FROM s_crmem_lin_wrk
+     WHERE sap_idoc_num     = ai_sap_idoc_num
+     ORDER BY rtn_item_qty desc; -- QC 11120 Added the order by clause
+  crmem_lin_wrk_rec           crmem_lin_wrk_cur%ROWTYPE;
+BEGIN
+  g_proc_name              := 'prc_create_crmem_dtl';
+  FOR crmem_lin_wrk_rec    IN crmem_lin_wrk_cur  LOOP
+    -- Now we try to associate the credit memo item back to the original
+    -- credit item.  If we cannot, we must create a credit item.
+    g_proc_name            := 'prc_create_crmem_dtl - A';
+    SELECT count( * ), max( cr_item_id )
+      INTO l_count_cr_item, l_cr_item_id
+      FROM s_cr_item s
+     WHERE s.cr_id          = ai_cr_id
+       AND s.item_num       = crmem_lin_wrk_rec.item_num;
+    -- A count of zero indicates the need to create a cr item row.
+    IF l_count_cr_item      = 0 THEN
+      -- The WHERE clause on each of these SELECTs includes all primary keys,
+      -- hence the "rownum = 1" to ensure no more than one row is searched.
+      g_proc_name          := 'prc_create_crmem_dtl - B';
+      SELECT sell_dscr_txt, mfg_unit_cd,unit_sell_prc
+        INTO l_sell_desc, l_mfg_unit_cd,l_unit_prc
+        FROM s_drug_item i
+       WHERE i.item_num     = crmem_lin_wrk_rec.item_num
+         AND rownum         = 1;
+      -- Issue #1078: Following assignment SELECT added.
+      g_proc_name          := 'prc_create_crmem_dtl - F';
+      SELECT nvl(pri_cust_acct_id, cust_acct_id)
+        INTO l_pri_cust_acct_id
+        FROM s_drug_cust_acct a
+       WHERE a.cust_acct_id = ai_cust_acct_id
+         AND rownum         = 1;
+      g_proc_name          := 'prc_create_crmem_dtl - C';
+      -- Issue #1078: in the WHERE clause of the following SELECT, replaced
+      --              ai_cust_acct_id with l_pri_cust_acct_id.
+  --BEGIN
+  --    SELECT spcl_prc_cd, proper_cntrc_prc
+  --      INTO l_prc_cd, l_curr_ctlg_prc
+  --     FROM s_drug_item_prc p
+  --     WHERE p.cust_acct_id = l_pri_cust_acct_id
+  --       AND p.item_num     = crmem_lin_wrk_rec.item_num
+  --       AND rownum         = 1;
+  -- EXCEPTION
+  --      WHEN NO_DATA_FOUND
+--				THEN
+--				l_prc_cd := 9;
+--				l_curr_ctlg_prc := l_unit_prc;
+--	END;
+      g_proc_name          := 'prc_create_crmem_dtl - D';
+--      INSERT INTO s_cr_item
+--           ( cr_item_id, cr_id, item_num, sell_dscr_txt, rtn_item_qty,
+--             mfg_unit_cd, invc_num, invc_dt, rsn_cd, invc_prc, prc_cd, curr_ctlg_prc )
+--      VALUES
+--           ( s_cr_item#cr_item_id.nextval, ai_cr_id, crmem_lin_wrk_rec.item_num,
+--             l_sell_desc, crmem_lin_wrk_rec.rtn_item_qty, l_mfg_unit_cd,
+--             crmem_lin_wrk_rec.invc_num, crmem_lin_wrk_rec.invc_dt,
+--             crmem_lin_wrk_rec.rsn_cd, null, l_prc_cd, l_curr_ctlg_prc )
+     INSERT INTO s_cr_item
+           ( cr_item_id, cr_id, item_num, sell_dscr_txt, rtn_item_qty,
+             mfg_unit_cd, invc_num, invc_dt, rsn_cd, invc_prc, prc_cd, curr_ctlg_prc )
+      VALUES
+           ( s_cr_item#cr_item_id.nextval, ai_cr_id, crmem_lin_wrk_rec.item_num,
+             l_sell_desc, crmem_lin_wrk_rec.rtn_item_qty, l_mfg_unit_cd,
+             crmem_lin_wrk_rec.invc_num, crmem_lin_wrk_rec.invc_dt,
+             crmem_lin_wrk_rec.rsn_cd, null,null,null )
+      RETURN cr_item_id  INTO l_cr_item_id;
+      aio_rows             := aio_rows + 1;
+    END IF;
+    g_proc_name            := 'prc_create_crmem_dtl - E';
+
+    --QC 11120 Start
+    BEGIN
+    IF crmem_lin_wrk_rec.invc_num is not null
+    THEN
+        SELECT cr_item_id
+        INTO v_cr_item_id
+        FROM S_CR_ITEM
+        WHERE S_CR_ITEM.INVC_NUM = crmem_lin_wrk_rec.invc_num
+        AND S_CR_ITEM.ITEM_NUM = crmem_lin_wrk_rec.item_num
+        AND S_CR_ITEM.CR_ID = ai_cr_id
+        AND s_cr_item.cr_item_id not in (    SELECT cr_item_id
+                                FROM S_CRMEM_ITEM
+                                WHERE CRMEM_ID=ai_crmem_id )
+        AND s_cr_item.rtn_item_qty >= crmem_lin_wrk_rec.rtn_item_qty
+        AND ROWNUM < 2;
+    ELSE
+        SELECT s_cr_item.cr_item_id
+        INTO v_cr_item_id
+        FROM s_cr_item
+        WHERE s_cr_item.cr_id = ai_cr_id
+        AND s_cr_item.item_num = crmem_lin_wrk_rec.item_num
+        AND s_cr_item.cr_item_id not in (    SELECT cr_item_id
+                                FROM S_CRMEM_ITEM
+                                WHERE CRMEM_ID=ai_crmem_id )
+        AND s_cr_item.rtn_item_qty >= crmem_lin_wrk_rec.rtn_item_qty
+        AND ROWNUM < 2;
+    END IF;
+
+    EXCEPTION
+        WHEN NO_DATA_FOUND THEN
+        v_cr_item_id := l_cr_item_id;
+    --QC 11120 End
+    END;
+
+    INSERT into s_crmem_item
+           ( crmem_item_id, crmem_id, item_num, rtn_item_qty,
+             invc_num, invc_dt, ext_item_prc, cr_item_id )
+    VALUES ( s_crmem_item#crmem_item_id.nextval, ai_crmem_id, crmem_lin_wrk_rec.item_num,
+             crmem_lin_wrk_rec.rtn_item_qty, crmem_lin_wrk_rec.invc_num,
+             crmem_lin_wrk_rec.invc_dt, crmem_lin_wrk_rec.ext_item_prc, v_cr_item_id ); --QC 11120 Changed l_cr_item_id to v_cr_item_id
+    aio_rows               := aio_rows + 1;
+  END LOOP;
+END prc_create_crmem_dtl;
+-------------------------------------------------------------------------------
+--Package Body Initialization Section.
+-------------------------------------------------------------------------------
+BEGIN
+  NULL;
+END pkg_load_crmem_sap_ELA;
+/
